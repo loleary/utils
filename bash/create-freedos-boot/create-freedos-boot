@@ -1,0 +1,241 @@
+#!/bin/sh
+#
+# create-freedos-boot - Creates a FreeDOS boot disk image
+# Copyright 2013 Larry O'Leary 
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# Default location for FreeDOS ISO image
+_fdISO="http://www.freedos.org/download/download/fd11src.iso"
+
+# Make sure all needed commands are available
+_abort=0
+_cmdList="basename cat mktemp cp wget mkfs.vfat syslinux mkdir mount umount sudo sync unzip nasm dd losetup makebootfat fdisk grep awk rm"
+for cmd in ${_cmdList}; do 
+    # We know one command has a period in its name 
+    # and that can not be used in a variable name so
+    # we first strip it out.
+    _varName=${cmd//./_}
+    eval cmd_${_varName}=$(command -v ${cmd} 2>/dev/null || { echo >&2 "Missing ${cmd}."; echo ""; })
+    eval [ -z \$cmd_${_varName} ] && _abort=1
+done
+[ $_abort -ne 0 ] && { echo >&2 "Aborting."; exit 2; }
+
+SCRIPT_NAME="$(${cmd_basename} "$0")"
+
+USAGE=$(${cmd_cat} <<EOF
+Usage: ${SCRIPT_NAME} [OPTION]... [FILE]
+Create a FreeDOS boot disk image and write it to FILE.
+
+  -h                This usage page.
+  -i PATH           Specifies a file or directory to include in the boot image.
+                    This argument can be used multiple times to specify 
+                    multiple files or directories that should be included. All 
+                    included files and paths will be located at the root 
+                    directory of the boot image.
+  -s SOURCE_ISO     The location of the FreeDOS ISO image. SOURCE_ISO can 
+                    either be a path or URL. If not specified, an ISO will be 
+                    downloaded.
+                    
+FILE can be a block device or device partition to where the FreeDOS boot image 
+and any included files will be written.
+
+If FILE is not a block device, a disk image file will be created and written 
+to FILE. The disk image will represnet a single boot floppy.
+
+If FILE is not specified, a file named freedos-boot.img will be created in the 
+user's home directory.
+
+EOF
+)
+
+# Parse the command-line arguments
+while getopts ":hs:i:" opt; do
+    case $opt in
+        h)
+            echo "${USAGE}"
+            exit 0
+            ;;
+        s)
+            _fdISO="${OPTARG}"
+            ;;
+        i)
+            [ -z "${_includes}" ] && {
+                _includes=${OPTARG}
+            } || {
+                _includes=${_includes}$'\n'${OPTARG}
+            }
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            echo "${USAGE}"
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            echo "${USAGE}"
+            exit 1
+            ;;
+    esac
+done
+shift $(($OPTIND - 1)) 
+# The first remaining argument will be the destination file/disk/partition
+_target="$1"
+
+# Create a temporary directory for us to work in
+_tmpDir="$(${cmd_mktemp} -d)"
+
+# Grab the FreeDOS ISO image
+[ -e "${_fdISO}" ] && {
+    ${cmd_cp} "${_fdISO}" "${_tmpDir}/freedos.iso"
+} || {
+    # Download the FreeDOS CD ISO image
+    echo "Retrieving FreeDOS installation image from ${_fdISO}..."
+    ${cmd_wget} -q "${_fdISO}" -O "${_tmpDir}/freedos.iso"
+}
+
+echo "Building boot image..."
+# Create a 64 MB FAT32 disk image
+# This will be used as our actual disk image when we are all done
+${cmd_mkfs_vfat} "${_tmpDir}/disk.img" -F 32 -C 64000 >/dev/null
+
+# Install MBR on disk image
+${cmd_syslinux} -m "${_tmpDir}/disk.img"
+
+# Mount the disk image
+${cmd_mkdir} -p "${_tmpDir}/tmp/disk_img"
+${cmd_sudo} ${cmd_mount} -t vfat -o uid=${USER},loop "${_tmpDir}/disk.img" "${_tmpDir}/tmp/disk_img"
+
+# Copy syslinux file over to disk image
+${cmd_mkdir} -p "${_tmpDir}/tmp/disk_img/boot/syslinux"
+${cmd_cp} -a /usr/share/syslinux/memdisk "${_tmpDir}/tmp/disk_img/boot/syslinux"
+
+# Install syslinux to boot directory of disk image
+${cmd_sync} 
+${cmd_sudo} ${cmd_umount} "${_tmpDir}/disk.img"
+${cmd_syslinux} -d boot "${_tmpDir}/disk.img"
+${cmd_sudo} ${cmd_mount} -t vfat -o uid=${USER},loop "${_tmpDir}/disk.img" "${_tmpDir}/tmp/disk_img"
+
+# Create syslinux.cfg file and put it on the disk image
+${cmd_cat} > "${_tmpDir}/tmp/disk_img/boot/syslinux.cfg" <<EOF
+DEFAULT FreeDOS
+
+LABEL FreeDOS
+  MENU LABEL Boot ^FreeDOS
+  MENU DEFAULT
+  KERNEL /boot/syslinux/memdisk
+  INITRD /boot/fdboot.img
+EOF
+
+# Get the files from FreeDOS ISO that we need
+${cmd_mkdir} -p "${_tmpDir}/tmp/freedos_iso"
+${cmd_sudo} ${cmd_mount} -o ro "${_tmpDir}/freedos.iso" "${_tmpDir}/tmp/freedos_iso"
+${cmd_cp} "${_tmpDir}/tmp/freedos_iso/freedos/packages/base/commandx.zip" "${_tmpDir}/tmp/commandx.zip"
+${cmd_cp} "${_tmpDir}/tmp/freedos_iso/freedos/packages/base/kernelx.zip" "${_tmpDir}/tmp/kernelx.zip"
+${cmd_sudo} ${cmd_umount} "${_tmpDir}/freedos.iso"
+
+${cmd_unzip} -qqo "${_tmpDir}/tmp/commandx.zip" -d "${_tmpDir}/tmp/commandx"
+${cmd_unzip} -qqo "${_tmpDir}/tmp/kernelx.zip" -d "${_tmpDir}/tmp/kernelx"
+${cmd_mkdir} "${_tmpDir}/tmp/root"
+${cmd_cp} "${_tmpDir}/tmp/commandx/bin/command.com" "${_tmpDir}/tmp/root"
+${cmd_cp} "${_tmpDir}/tmp/kernelx/bin/kernel.sys" "${_tmpDir}/tmp/root"
+
+# Build FAT boot sectors
+${cmd_nasm} -dISFAT12 "${_tmpDir}/tmp/kernelx/source/kernel/boot/boot.asm" -o "${_tmpDir}/tmp/fat12.bin"
+${cmd_nasm} -dISFAT16 "${_tmpDir}/tmp/kernelx/source/kernel/boot/boot.asm" -o "${_tmpDir}/tmp/fat16.bin"
+${cmd_nasm} "${_tmpDir}/tmp/kernelx/source/kernel/boot/boot32lb.asm" -o "${_tmpDir}/tmp/fat32lba.bin"
+
+# Create an empty AUTOEXEC.BAT in fdboot
+${cmd_cat} > "${_tmpDir}/tmp/root/autoexec.bat" << EOF
+@echo off
+PATH=A:\\
+EOF
+
+# Copy any other files we want to fdboot_img
+# This is where the -i command-line argument gets used
+OIFS="${IFS}"
+IFS=$'\n'
+for _file in ${_includes}; do
+    ${cmd_cp} -a "${_file}" "${_tmpDir}/tmp/root"
+done
+IFS="${OFS}"
+
+# Create a new disk image that will represent the FreeDOS boot image
+sizeMB=32
+size=$(($sizeMB*1024*1024/512))
+${cmd_dd} if=/dev/zero of="${_tmpDir}/fdboot.img" bs=512 count=$size 2>/dev/null
+
+# To make a DOS boot disk we need to act directly on a block
+# device. losetup allows us to link our fdboot.img file to an 
+# actual block device by making it a loop device. We are not 
+# yet mounting it because we can't create the FAT while its 
+# mounted.
+loopDev=$(${cmd_sudo} ${cmd_losetup} -f)
+${cmd_sudo} ${cmd_losetup} ${loopDev} "${_tmpDir}/fdboot.img"
+
+# Use makebootfat to copy our boot sector
+${cmd_sudo} ${cmd_makebootfat} -o ${loopDev} -1 "/tmp/fat12.bin" -2 "/tmp/fat16.bin" -3 "/tmp/fat32lba.bin" -D "${_tmpDir}/tmp/root"  
+${cmd_sync}
+${cmd_sudo} ${cmd_losetup} -d ${loopDev}
+
+# Copy our new fdboot.img over to our disk image
+${cmd_cp} "${_tmpDir}/fdboot.img" "${_tmpDir}/tmp/disk_img/boot/fdboot.img"
+
+# Unmount disk.img as we are done
+${cmd_sync}
+${cmd_sudo} ${cmd_umount} "${_tmpDir}/disk.img"
+
+# Copy disk.img from our temp directory to _target or create one
+[ -z "${_target}" ] && _target="${HOME}/freedos-boot.img"
+[ -b "${_target}" ] && {
+    # _target is a device
+    echo "Target ${_target} is a block device."
+    echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+    echo 'WARNING: Proceeding will destroy data!'
+    echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+    ${cmd_sudo} ${cmd_fdisk} -l "${_target}"
+    while [ 1 -eq 1 ]; do
+        echo "If this is the correct device, type YES to proceed"
+        echo -n "or NO to cancel [YES/NO]: "
+        read cont
+        case "${cont}" in
+            YES|yes|NO|no|N|n|No) break
+            ;;
+        esac
+    done
+    if [ "${cont}" = "YES" -o "${cont}" = "yes" ]; then
+        # unmount all partitions of target
+        for _mnt in $(${cmd_mount} | ${cmd_grep} -E "^${_target}[ 0-9]+" | ${cmd_awk} '{print $1}'); do 
+            echo "Unmounting ${_mnt}..."
+            ${cmd_sync}
+            ${cmd_sudo} ${cmd_umount} "${_mnt}"
+        done
+        # delete all existing data on target
+        # we do this to make sure we have full control over the MBR and boot
+        # partition.
+        echo "Preparing device ${_target}..."
+        ${cmd_sudo} ${cmd_dd} if=/dev/zero of="${_target}"  bs=512  count=1 2>/dev/null
+        
+        echo "Writing boot image to ${_target}..."
+        ${cmd_sudo} ${cmd_dd} if="${_tmpDir}/disk.img" of="${_target}" conv=notrunc bs=512 2>/dev/null
+    fi
+} || {
+    echo "Writing boot image to ${_target}..."
+    ${cmd_cp} -a "${_tmpDir}/disk.img" "${_target}"
+}
+
+# Cleanup after ourselves
+${cmd_rm} -rf "${_tmpDir}"
+
